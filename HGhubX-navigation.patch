@@ -218,26 +218,70 @@ index 0ab2034..6e20c73 100644
              api::account::api_register,
              api::account::api_logout,
 diff --git a/src/app/App.tsx b/src/app/App.tsx
-index e0f9306..7dc7a7a 100644
+index e0f9306..cb08b4d 100644
 --- a/src/app/App.tsx
 +++ b/src/app/App.tsx
 @@ -1,6 +1,6 @@
  import { LiquidIndicator, Loader } from "../shared/ui/ios/effects";
  import { Button } from "../shared/ui/ios/controls";
 -import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-+import { lazy, startTransition, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
++import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
  import { useStore, type Page, type Tab } from "../shared/model/store";
  import { PageCoveredContext } from "../shared/model/pageVisibility";
  import { isMobile, selfTest } from "../shared/api/api";
-@@ -16,6 +16,7 @@ import { tracePlayback } from "../shared/diagnostics/playbackDiagnostics";
+@@ -15,17 +15,24 @@ import ResizeHandles from "./shell/ResizeHandles";
+ import { tracePlayback } from "../shared/diagnostics/playbackDiagnostics";
  import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF } from "../shared/ui/icons";
  import { tr, useLocale } from "../shared/i18n";
++import { useEdgeSwipeBack } from "../shared/ui/hooks/useEdgeSwipeBack";
  
 +import { hapticSelect } from "../shared/lib/haptics";
  // Local chunks load on first visit; visited tabs stay mounted as before.
  // Feed (+ hls.js) is separated from the initial shell so cold start mounts chrome and
  // starts app_boot / autoLine / api_feed before compiling the 524 kB media engine.
-@@ -57,7 +58,7 @@ function TabBar() {
+-const Feed = lazy(() => import("../features/feed/Feed"));
+-const Search = lazy(() => import("../features/search/Search"));
+-const RankPage = lazy(() => import("../features/search/Search").then(module => ({ default: module.RankPage })));
+-const Category = lazy(() => import("../features/category/Category"));
+-const ChannelPage = lazy(() => import("../features/category/Category").then(module => ({ default: module.ChannelPage })));
+-const Profile = lazy(() => import("../features/account/Profile"));
+-const SettingsPage = lazy(() => import("../features/settings/Settings"));
++const loadFeed = () => import("../features/feed/Feed");
++const loadSearch = () => import("../features/search/Search");
++const loadCategory = () => import("../features/category/Category");
++const loadProfile = () => import("../features/account/Profile");
++const loadSettings = () => import("../features/settings/Settings");
++const Feed = lazy(loadFeed);
++const Search = lazy(loadSearch);
++const RankPage = lazy(() => loadSearch().then(module => ({ default: module.RankPage })));
++const Category = lazy(loadCategory);
++const ChannelPage = lazy(() => loadCategory().then(module => ({ default: module.ChannelPage })));
++const Profile = lazy(loadProfile);
++const SettingsPage = lazy(loadSettings);
+ const PostsPage = lazy(() => import("../features/posts/Posts").then(module => ({ default: module.PostsPage })));
+ const PostDetail = lazy(() => import("../features/posts/Posts").then(module => ({ default: module.PostDetail })));
+ const TopicsPage = lazy(() => import("../features/discover/Discover").then(module => ({ default: module.TopicsPage })));
+@@ -35,6 +42,10 @@ const TagPage = lazy(() => import("../features/discover/Discover").then(module =
+ const FollowingPage = lazy(() => import("../features/account/User").then(module => ({ default: module.FollowingPage })));
+ const UserPage = lazy(() => import("../features/account/User").then(module => ({ default: module.UserPage })));
+ 
++const TAB_ORDER: readonly Tab[] = ["home", "search", "category", "profile"];
++const STACK_POP_MS = 130;
++const STACK_PUSH_MS = 260;
++
+ function PageLoading() {
+   return <div className="absolute inset-0 grid place-items-center bg-bg"><Loader label={tr("页面加载中")} /></div>;
+ }
+@@ -42,7 +53,7 @@ function PageLoading() {
+ const SELECTABLE_TEXT = 'input, textarea, [contenteditable="true"], .select-text, .article-body';
+ const isSelectableText = (target: EventTarget | null) => target instanceof Element && !!target.closest(SELECTABLE_TEXT);
+ 
+-function TabBar() {
++function TabBar({ onSameTab }: { onSameTab?: (tab: Tab) => void }) {
+   const { tab, setTab } = useStore();
+   const items = [
+     { key: "home", label: tr("首页"), Icon: IHome, Active: IHomeF },
+@@ -57,17 +68,25 @@ function TabBar() {
        <div className="ios-mobile-nav-items">
          {items.map(({ key, label, Icon, Active }) => {
            const Glyph = tab === key ? Active : Icon;
@@ -246,65 +290,420 @@ index e0f9306..7dc7a7a 100644
              /* Re-tapping the active Search tab returns to the search landing state;
                 the input clear button is hard to reach on tall screens. */
              if (key === "search" && tab === "search") {
-@@ -68,7 +69,10 @@ function TabBar() {
++              hapticSelect();
+               window.dispatchEvent(new Event("hg:search-reset"));
+               return;
+             }
+             if (key === "profile" && tab === "profile") {
++              hapticSelect();
                window.dispatchEvent(new Event("hg:profile-reset"));
                return;
              }
--            setTab(key);
-+            if (key === tab) return;
++            if (key === tab) {
++              hapticSelect();
++              onSameTab?.(key);
++              return;
++            }
 +            hapticSelect();
-+            /* 低优先级提交：tab 图标与触感立刻响应，页面渲染让出一帧。 */
-+            startTransition(() => setTab(key));
+             setTab(key);
            }}
              aria-current={tab === key ? "page" : undefined}>
-             <Glyph size={22} /><span>{label}</span>
-@@ -177,12 +181,9 @@ function LayerBox({
-   }, [hidden]);
+@@ -110,17 +129,24 @@ function StackPageContent({ page, onBack, wide, top, bottomInset, loginOpen }: {
+ 
+ /** Hide covered pages from the compositor while keeping React state and scroll offsets intact. */
+ function LayerBox({
+-  hidden, inert, ariaHidden, className, enterClass, style, children,
++  hidden, revealUnder = false, inert, ariaHidden, className, enterClass, underClass, layerRef, style, children,
+ }: {
+   hidden: boolean;
++  revealUnder?: boolean;
+   inert: boolean;
+   ariaHidden: boolean;
+   className: string;
+   enterClass?: string;
++  underClass?: string;
++  layerRef?: RefObject<HTMLDivElement | null>;
+   style?: CSSProperties;
+   children: ReactNode;
+ }) {
+-  const ref = useRef<HTMLDivElement>(null);
++  const localRef = useRef<HTMLDivElement>(null);
++  const setRefs = useCallback((node: HTMLDivElement | null) => {
++    localRef.current = node;
++    if (layerRef) layerRef.current = node;
++  }, [layerRef]);
+   const scrollOffsetsRef = useRef<Map<HTMLElement, number>>(new Map());
+   const hiddenRef = useRef(hidden);
+   hiddenRef.current = hidden;
+@@ -134,12 +160,12 @@ function LayerBox({
+   useEffect(() => {
+     if (hidden || entered || !enterClass) return undefined;
+     // Fallback for prefers-reduced-motion or interrupted animations where animationend never fires.
+-    const timer = window.setTimeout(() => setEntered(true), 480);
++    const timer = window.setTimeout(() => setEntered(true), 420);
+     return () => window.clearTimeout(timer);
+   }, [hidden, entered, enterClass]);
+ 
+   useEffect(() => {
+-    const root = ref.current;
++    const root = localRef.current;
+     if (!root) return;
+     const onScroll = (e: Event) => {
+       if (hiddenRef.current) return;
+@@ -164,7 +190,7 @@ function LayerBox({
+   }, []);
+ 
+   useLayoutEffect(() => {
+-    if (hidden) return;
++    if (hidden && !revealUnder) return;
+     const saved = scrollOffsetsRef.current;
+     if (!saved.size) return;
+     for (const [el, top] of Array.from(saved.entries())) {
+@@ -174,23 +200,24 @@ function LayerBox({
+       }
+       if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+     }
+-  }, [hidden]);
++  }, [hidden, revealUnder]);
  
    const entering = !hidden && !entered && !!enterClass;
--  const baseStyle: CSSProperties | undefined = entering
+   const baseStyle: CSSProperties | undefined = entering
 -    ? { ...style, boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }
-+  const boxStyle = hidden && hasPip
-+    ? { ...style, visibility: "hidden" as const, pointerEvents: "none" as const }
++    ? { ...style, boxShadow: "-12px 0 32px rgba(0,0,0,.38)" }
      : style;
 -  const boxStyle: CSSProperties | undefined = hidden && hasPip
 -    ? { ...baseStyle, visibility: "hidden", pointerEvents: "none" }
--    : baseStyle;
++  const keepVisible = hasPip || revealUnder;
++  const boxStyle: CSSProperties | undefined = hidden && keepVisible
++    ? { ...baseStyle, ...(hasPip && !revealUnder ? { visibility: "hidden" } : undefined), pointerEvents: "none" }
+     : baseStyle;
    const boxClass = hidden
-     ? (hasPip ? `${className} pointer-events-none` : `${className} hidden pointer-events-none`)
-     : `${className}${entering ? ` ${enterClass}` : ""}`;
-@@ -205,15 +206,27 @@ function MainTabs({ wide, pageActive, covered, bottomInset }: { wide: boolean; p
+-    ? (hasPip ? `${className} pointer-events-none` : `${className} hidden pointer-events-none`)
+-    : `${className}${entering ? ` ${enterClass}` : ""}`;
++    ? (keepVisible ? `${className} pointer-events-none` : `${className} hidden pointer-events-none`)
++    : `${className}${entering ? ` ${enterClass}` : ""}${!entering && underClass ? ` ${underClass}` : ""}`;
+ 
+   return (
+     <PageCoveredContext.Provider value={hidden}>
+-      <div ref={ref} inert={inert} aria-hidden={ariaHidden} className={boxClass} style={boxStyle}
+-        onAnimationEnd={entering ? (e) => { if (e.target === ref.current) setEntered(true); } : undefined}>
++      <div ref={setRefs} inert={inert} aria-hidden={ariaHidden} className={boxClass} style={boxStyle}
++        onAnimationEnd={entering ? (e) => { if (e.target === localRef.current) setEntered(true); } : undefined}>
+         {children}
+       </div>
+     </PageCoveredContext.Provider>
+@@ -198,30 +225,196 @@ function LayerBox({
+ }
+ 
+ /* ============ 应用主体 ============ */
+-function MainTabs({ wide, pageActive, covered, bottomInset }: { wide: boolean; pageActive: boolean; covered: boolean; bottomInset: number }) {
++const MainTabs = memo(function MainTabs({
++  wide, pageActive, covered, revealUnder, underClass, layerRef, bottomInset,
++}: {
++  wide: boolean;
++  pageActive: boolean;
++  covered: boolean;
++  revealUnder?: boolean;
++  underClass?: string;
++  layerRef?: RefObject<HTMLDivElement | null>;
++  bottomInset: number;
++}) {
+   const { tab } = useStore();
+   const [visited, setVisited] = useState<ReadonlySet<Tab>>(() => new Set());
++  const prevTabRef = useRef<Tab>(tab);
++  const tabDirRef = useRef<"forward" | "backward" | "none">("none");
++  if (prevTabRef.current !== tab) {
++    const prevIdx = TAB_ORDER.indexOf(prevTabRef.current);
++    const nextIdx = TAB_ORDER.indexOf(tab);
++    tabDirRef.current = nextIdx >= prevIdx ? "forward" : "backward";
++    prevTabRef.current = tab;
++  }
++
+   useEffect(() => {
      if (pageActive) setVisited(previous => previous.has(tab) ? previous : new Set([...previous, tab]));
    }, [tab, pageActive]);
-   const mounted = (key: Tab) => visited.has(key) || (pageActive && tab === key);
-+  const mountHome = mounted("home");
-+  const activeHome = pageActive && tab === "home";
-+  const paneHome = useMemo(() => mountHome && <Home active={activeHome} bottomInset={bottomInset} />, [mountHome, activeHome, bottomInset]);
-+  const mountSearch = mounted("search");
-+  const activeSearch = pageActive && tab === "search";
-+  const paneSearch = useMemo(() => mountSearch && <Suspense fallback={<PageLoading />}> <Search active={activeSearch} wide={wide} /></Suspense>, [mountSearch, activeSearch, wide]);
-+  const mountCategory = mounted("category");
-+  const activeCategory = pageActive && tab === "category";
-+  const paneCategory = useMemo(() => mountCategory && <Suspense fallback={<PageLoading />}> <Category active={activeCategory} wide={wide} /></Suspense>, [mountCategory, activeCategory, wide]);
-+  const mountProfile = mounted("profile");
-+  const activeProfile = pageActive && tab === "profile";
-+  const paneProfile = useMemo(() => mountProfile && <Suspense fallback={<PageLoading />}> <Profile active={activeProfile} wide={wide} /></Suspense>, [mountProfile, activeProfile, wide]);
-   const visible = (key: Tab) => tab === key ? `absolute inset-0 ${key === "home" ? "" : "ios-tab-active"}` : "absolute inset-0 hidden pointer-events-none";
+-  const mounted = (key: Tab) => visited.has(key) || (pageActive && tab === key);
+-  const visible = (key: Tab) => tab === key ? `absolute inset-0 ${key === "home" ? "" : "ios-tab-active"}` : "absolute inset-0 hidden pointer-events-none";
++
++  // Preload sibling tab chunks once idle so the first switch never flashes a spinner.
++  useEffect(() => {
++    let cancelled = false;
++    const warm = () => {
++      if (cancelled) return;
++      void loadSearch();
++      void loadCategory();
++      void loadProfile();
++      void loadSettings();
++    };
++    const w = window as Window & {
++      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
++      cancelIdleCallback?: (id: number) => void;
++    };
++    if (typeof w.requestIdleCallback === "function") {
++      const id = w.requestIdleCallback(warm, { timeout: 1200 });
++      return () => { cancelled = true; w.cancelIdleCallback?.(id); };
++    }
++    const t = window.setTimeout(warm, 500);
++    return () => { cancelled = true; window.clearTimeout(t); };
++  }, []);
++
++  const homeActive = pageActive && tab === "home";
++  const searchActive = pageActive && tab === "search";
++  const categoryActive = pageActive && tab === "category";
++  const profileActive = pageActive && tab === "profile";
++
++  const homeMounted = visited.has("home") || homeActive;
++  const searchMounted = visited.has("search") || searchActive;
++  const categoryMounted = visited.has("category") || categoryActive;
++  const profileMounted = visited.has("profile") || profileActive;
++
++  /* 切 tab 只让真正变化的两页重渲染：每页仅依赖自身的 active 与 mounted 状态，
++     其余页面复用同一个 element 引用，React 会直接跳过整棵子树。 */
++  const paneHome = useMemo(() => homeMounted && <Home active={homeActive} bottomInset={bottomInset} />, [homeMounted, homeActive, bottomInset]);
++  const paneSearch = useMemo(() => searchMounted && <Suspense fallback={<PageLoading />}><Search active={searchActive} wide={wide} /></Suspense>, [searchMounted, searchActive, wide]);
++  const paneCategory = useMemo(() => categoryMounted && <Suspense fallback={<PageLoading />}><Category wide={wide} active={categoryActive} /></Suspense>, [categoryMounted, categoryActive, wide]);
++  const paneProfile = useMemo(() => profileMounted && <Suspense fallback={<PageLoading />}><Profile wide={wide} active={profileActive} /></Suspense>, [profileMounted, profileActive, wide]);
++
++  const tabDir = tabDirRef.current;
++  const visible = (key: Tab) => tab === key
++    ? `absolute inset-0${tabDir === "none" ? "" : " ios-tab-active"}`
++    : "absolute inset-0 hidden pointer-events-none";
++
    // First visits mount on demand; subsequent switches preserve queries, scroll and playback state.
    // DialogFrame's syncBackground() owns modal inertness so portals inside fullscreenElement never inherit ancestor inert.
    return (
-     <LayerBox hidden={covered} inert={covered} ariaHidden={covered} className="absolute inset-0">
+-    <LayerBox hidden={covered} inert={covered} ariaHidden={covered} className="absolute inset-0">
 -      <div className={visible("home")} inert={covered || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{mounted("home") && <Home active={pageActive && tab === "home"} bottomInset={bottomInset} />}</div>
 -      <div className={visible("search")} inert={covered || tab !== "search"} aria-hidden={!pageActive || tab !== "search"}>{mounted("search") && <Suspense fallback={<PageLoading />}><Search active={pageActive && tab === "search"} wide={wide} /></Suspense>}</div>
 -      <div className={visible("category")} inert={covered || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{mounted("category") && <Suspense fallback={<PageLoading />}><Category wide={wide} active={pageActive && tab === "category"} /></Suspense>}</div>
 -      <div className={visible("profile")} inert={covered || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{mounted("profile") && <Suspense fallback={<PageLoading />}><Profile wide={wide} active={pageActive && tab === "profile"} /></Suspense>}</div>
-+      <div className={visible("home")} inert={covered || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{paneHome}</div>
-+      <div className={visible("search")} inert={covered || tab !== "search"} aria-hidden={!pageActive || tab !== "search"}>{paneSearch}</div>
-+      <div className={visible("category")} inert={covered || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{paneCategory}</div>
-+      <div className={visible("profile")} inert={covered || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{paneProfile}</div>
++    <LayerBox hidden={covered} revealUnder={revealUnder} underClass={underClass} layerRef={layerRef} inert={covered} ariaHidden={covered} className="absolute inset-0">
++      <div className={visible("home")} data-tab-dir={tab === "home" ? tabDir : undefined} inert={covered || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{paneHome}</div>
++      <div className={visible("search")} data-tab-dir={tab === "search" ? tabDir : undefined} inert={covered || tab !== "search"} aria-hidden={!pageActive || tab !== "search"}>{paneSearch}</div>
++      <div className={visible("category")} data-tab-dir={tab === "category" ? tabDir : undefined} inert={covered || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{paneCategory}</div>
++      <div className={visible("profile")} data-tab-dir={tab === "profile" ? tabDir : undefined} inert={covered || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{paneProfile}</div>
      </LayerBox>
    );
++});
++
++/** Manage push/pop transition windows so covered layers only stay visible while animating. */
++function useStackTransitions(stack: Page[], platform: string) {
++  const prevStackRef = useRef<Page[]>(stack);
++  const skipExitRef = useRef(false);
++  const [exiting, setExiting] = useState<{ page: Page; index: number } | null>(null);
++  const [underReveal, setUnderReveal] = useState<"push" | "pop" | null>(null);
++
++  useLayoutEffect(() => {
++    const prev = prevStackRef.current;
++    prevStackRef.current = stack;
++    const reduced = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
++
++    if (stack.length > prev.length) {
++      setExiting(null);
++      const top = stack[stack.length - 1];
++      if (!reduced && !(platform === "android" && top?.kind === "feed")) {
++        setUnderReveal("push");
++        const t = window.setTimeout(() => setUnderReveal(null), STACK_PUSH_MS);
++        return () => window.clearTimeout(t);
++      }
++      setUnderReveal(null);
++      return undefined;
++    }
++
++    if (stack.length === prev.length - 1) {
++      const popped = prev[prev.length - 1];
++      const stillInStack = popped && stack.some(item => item.key === popped.key);
++      if (skipExitRef.current) {
++        skipExitRef.current = false;
++        setExiting(null);
++        setUnderReveal(null);
++        return undefined;
++      }
++      if (popped && !stillInStack && !reduced && !(platform === "android" && popped.kind === "feed")) {
++        setExiting({ page: popped, index: prev.length - 1 });
++        setUnderReveal("pop");
++        const t = window.setTimeout(() => {
++          setExiting(null);
++          setUnderReveal(null);
++        }, STACK_POP_MS);
++        return () => window.clearTimeout(t);
++      }
++    }
++
++    setExiting(null);
++    setUnderReveal(null);
++    return undefined;
++  }, [stack, platform]);
++
++  const markSwipePop = useCallback(() => {
++    skipExitRef.current = true;
++  }, []);
++
++  return { exiting, underReveal, markSwipePop };
++}
++
++function StackLayers({
++  stack, exiting, underReveal, peeking, enterClassFor, exitClass, pop, wide, bottomInset, loginOpen,
++  topLayerRef, underLayerRef,
++}: {
++  stack: Page[];
++  exiting: { page: Page; index: number } | null;
++  underReveal: "push" | "pop" | null;
++  peeking: boolean;
++  enterClassFor: (page: Page) => string | undefined;
++  exitClass: string;
++  pop: () => void;
++  wide: boolean;
++  bottomInset: number;
++  loginOpen: boolean;
++  topLayerRef?: RefObject<HTMLDivElement | null>;
++  underLayerRef?: RefObject<HTMLDivElement | null>;
++}) {
++  return <>
++    {stack.map((p, i) => {
++      const top = i === stack.length - 1;
++      const isUnder = i === stack.length - 2;
++      const revealUnder = isUnder && (peeking || underReveal === "push");
++      const underClass = top && underReveal === "pop" ? "a-page-under-in" : undefined;
++      return (
++        <LayerBox key={p.key} hidden={!top} revealUnder={revealUnder} inert={!top} ariaHidden={!top || loginOpen}
++          layerRef={top ? topLayerRef : isUnder ? underLayerRef : undefined}
++          className="absolute inset-0 bg-bg isolate"
++          enterClass={enterClassFor(p)}
++          underClass={underClass}
++          style={{ zIndex: 30 + i }}>
++          <StackPage page={p} onBack={pop} wide={wide} top={top} bottomInset={bottomInset} loginOpen={loginOpen} />
++        </LayerBox>
++      );
++    })}
++    {exiting && (
++      <LayerBox key={`exit-${exiting.page.key}`} hidden={false} inert={true} ariaHidden={true}
++        className={`absolute inset-0 bg-bg isolate pointer-events-none ${exitClass}`}
++        style={{ zIndex: 30 + exiting.index, boxShadow: "-12px 0 32px rgba(0,0,0,.38)" }}>
++        <StackPage page={exiting.page} onBack={pop} wide={wide} top={false} bottomInset={bottomInset} loginOpen={loginOpen} />
++      </LayerBox>
++    )}
++  </>;
  }
+ 
+ function AppBody() {
+   const { platform, tab, setTab, stack, pop, loginOpen, setLoginOpen, fs, setFs, clean, locked } = useStore();
+   const mainRef = useRef<HTMLDivElement>(null);
++  const topLayerRef = useRef<HTMLDivElement>(null);
++  const underLayerRef = useRef<HTMLDivElement>(null);
+   const [wide, setWide] = useState(false);
++  const [peeking, setPeeking] = useState(false);
++  const { exiting, underReveal, markSwipePop } = useStackTransitions(stack, platform);
+ 
+   useLayoutEffect(() => {
+     const el = mainRef.current;
+@@ -232,6 +425,18 @@ function AppBody() {
+     return () => ro.disconnect();
+   }, []);
+ 
++  useEdgeSwipeBack({
++    enabled: isMobile && stack.length > 0 && !fs && !locked && !loginOpen,
++    containerRef: mainRef,
++    topLayerRef,
++    underLayerRef,
++    onPeekChange: setPeeking,
++    onSwipeCommit: () => {
++      markSwipePop();
++      pop();
++    },
++  });
++
+   /* 全局键盘 */
+   useEffect(() => {
+     const fn = (e: KeyboardEvent) => {
+@@ -252,31 +457,35 @@ function AppBody() {
+     return () => window.removeEventListener("keydown", fn);
+   }, [stack.length, pop, setTab, loginOpen, setLoginOpen, fs, setFs]);
+ 
++  const scrollActiveTabToTop = useCallback((activeTab: Tab) => {
++    const root = mainRef.current;
++    if (!root || activeTab === "home") return;
++    root.querySelector<HTMLElement>(".ios-tab-active .scroll-y")?.scrollTo({ top: 0, behavior: "smooth" });
++  }, []);
++
+   const pageActive = stack.length === 0 && !loginOpen;
+   const bottomInset = fs || clean || locked ? 0 : 78;
+   /* 栈页（从搜索/分类/我的进入的播放页、图文页）没有底栏，
+      底部只让出安全区。之前多留了 20px，视频底边会露出一条
+      「底栏」似的窄缝（底部的压暗渐变到不了屏幕最底）。 */
+   const stackInset = 0;
++  const rootRevealUnder = (stack.length === 1 && (peeking || underReveal === "push"));
++  const rootUnderClass = stack.length === 0 && underReveal === "pop" ? "a-page-under-in" : undefined;
+ 
+   return (
+     <div className={`absolute inset-0 flex bg-canvas plat-${platform}`}>
+       <div ref={mainRef} className="relative flex-1 min-w-0 overflow-hidden win-main">
+-        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0} bottomInset={bottomInset} />
+-
+-        {stack.map((p, i) => {
+-          const top = i === stack.length - 1;
+-          return (
+-            <LayerBox key={p.key} hidden={!top} inert={!top} ariaHidden={!top || loginOpen}
+-              className="absolute inset-0 bg-bg isolate"
+-              enterClass={platform === "android" && p.kind === "feed" ? undefined : "a-page-in"}
+-              style={{ zIndex: 30 + i }}>
+-              <StackPage page={p} onBack={pop} wide={wide} top={top} bottomInset={stackInset} loginOpen={loginOpen} />
+-            </LayerBox>
+-          );
+-        })}
++        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0}
++          revealUnder={rootRevealUnder} underClass={rootUnderClass}
++          layerRef={stack.length === 1 ? underLayerRef : undefined}
++          bottomInset={bottomInset} />
+ 
+-        {!fs && !clean && !locked && stack.length === 0 && <TabBar />}
++        <StackLayers stack={stack} exiting={exiting} underReveal={underReveal} peeking={peeking}
++          enterClassFor={(p) => (platform === "android" && p.kind === "feed" ? undefined : "a-page-in")}
++          exitClass="a-page-out" pop={pop} wide={wide} bottomInset={stackInset} loginOpen={loginOpen}
++          topLayerRef={topLayerRef} underLayerRef={stack.length >= 2 ? underLayerRef : undefined} />
++
++        {!fs && !clean && !locked && stack.length === 0 && <TabBar onSameTab={scrollActiveTabToTop} />}
+       </div>
+     </div>
+   );
+@@ -308,6 +517,7 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+   const { stack, pop, loginOpen, setLoginOpen, tab, setTab, platform, fs, setFs, setTheater } = useStore();
+   const mainRef = useRef<HTMLDivElement>(null);
+   const [wide, setWide] = useState(true);
++  const { exiting, underReveal } = useStackTransitions(stack, platform);
+ 
+   useLayoutEffect(() => {
+     const el = mainRef.current;
+@@ -345,22 +555,18 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+   }, [stack.length, pop, setTab, loginOpen, setLoginOpen, fs, setFs, theater, setTheater]);
+ 
+   const pageActive = stack.length === 0 && !loginOpen;
++  const rootRevealUnder = stack.length === 1 && underReveal === "push";
++  const rootUnderClass = stack.length === 0 && underReveal === "pop" ? "a-page-under-in" : undefined;
+ 
+   return (
+     <div className={`absolute inset-0 flex bg-canvas plat-${platform}`}>
+       {!theater && <DesktopRail collapsed={collapsed} />}
+       <div ref={mainRef} className={`relative flex-1 min-w-0 overflow-hidden win-main ${theater ? "is-theater-main" : ""}`}>
+-        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0} bottomInset={14} />
+-        {stack.map((p, i) => {
+-          const top = i === stack.length - 1;
+-          return (
+-            <LayerBox key={p.key} hidden={!top} inert={!top} ariaHidden={!top || loginOpen}
+-              className="absolute inset-0 bg-bg isolate" enterClass="win-page-in"
+-              style={{ zIndex: 30 + i }}>
+-              <StackPage page={p} onBack={pop} wide={wide} top={top} bottomInset={14} loginOpen={loginOpen} />
+-            </LayerBox>
+-          );
+-        })}
++        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0}
++          revealUnder={rootRevealUnder} underClass={rootUnderClass} bottomInset={14} />
++        <StackLayers stack={stack} exiting={exiting} underReveal={underReveal} peeking={false}
++          enterClassFor={() => "win-page-in"} exitClass="win-page-out"
++          pop={pop} wide={wide} bottomInset={14} loginOpen={loginOpen} />
+       </div>
+     </div>
+   );
 diff --git a/src/features/feed/FeedPlayerShellChrome.tsx b/src/features/feed/FeedPlayerShellChrome.tsx
 index e4c90f8..93f7788 100644
 --- a/src/features/feed/FeedPlayerShellChrome.tsx
@@ -339,6 +738,30 @@ index 10a116b..c0a4c76 100644
        <Button className="mobile-hold-guide-done" onClick={onClose} data-autofocus>{tr("知道了")}</Button>
      </div>
    </div>;
+diff --git a/src/features/feed/PanelSwipeArea.tsx b/src/features/feed/PanelSwipeArea.tsx
+index f0fc2cd..0ee9694 100644
+--- a/src/features/feed/PanelSwipeArea.tsx
++++ b/src/features/feed/PanelSwipeArea.tsx
+@@ -1,5 +1,6 @@
+ import { useEffect, useRef, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+ import type { FeedPanel } from "./useFeedViewport";
++import { haptic, hapticSelect } from "../../shared/lib/haptics";
+ 
+ const TAB_SWIPE_DISTANCE = 56;
+ const CLOSE_SWIPE_DISTANCE = 72;
+@@ -61,10 +62,10 @@ export function PanelSwipeArea({ panel, onChange, className = "", children }: {
+     const dy = endY - y;
+     if (Math.abs(dx) >= TAB_SWIPE_DISTANCE && Math.abs(dx) > Math.abs(dy) * AXIS_RATIO) {
+       const next: PanelTab = dx < 0 ? "episodes" : "detail";
+-      if (next !== panel) onChange(next);
++      if (next !== panel) { hapticSelect(); onChange(next); }
+       return;
+     }
+-    if (atTop && dy >= CLOSE_SWIPE_DISTANCE && dy > Math.abs(dx) * AXIS_RATIO) onChange(null);
++    if (atTop && dy >= CLOSE_SWIPE_DISTANCE && dy > Math.abs(dx) * AXIS_RATIO) { haptic("light"); onChange(null); }
+   };
+ 
+   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
 diff --git a/src/features/feed/mobileHold.ts b/src/features/feed/mobileHold.ts
 index 5040c5b..c9b980c 100644
 --- a/src/features/feed/mobileHold.ts
@@ -616,17 +1039,231 @@ index 0000000..8d9e5c2
 +    if (document.visibilityState === "visible") hapticPrepare();
 +  });
 +}
+diff --git a/src/shared/ui/hooks/useEdgeSwipeBack.ts b/src/shared/ui/hooks/useEdgeSwipeBack.ts
+new file mode 100644
+index 0000000..e88d587
+--- /dev/null
++++ b/src/shared/ui/hooks/useEdgeSwipeBack.ts
+@@ -0,0 +1,190 @@
++import { useEffect, useRef, type RefObject } from "react";
++import { haptic } from "../../lib/haptics";
++
++const EDGE_WIDTH = 28;
++const COMMIT_RATIO = 0.32;
++const FLICK_VELOCITY = 0.42; // px/ms
++const AXIS_RATIO = 1.35;
++
++type Options = {
++  enabled: boolean;
++  containerRef: RefObject<HTMLElement | null>;
++  topLayerRef: RefObject<HTMLDivElement | null>;
++  underLayerRef: RefObject<HTMLDivElement | null>;
++  onPeekChange: (peeking: boolean) => void;
++  onSwipeCommit: () => void;
++};
++
++/**
++ * iOS-style interactive left-edge swipe-back for stacked pages.
++ * Drives DOM transforms directly during touchmove to avoid per-frame React renders.
++ */
++export function useEdgeSwipeBack({
++  enabled,
++  containerRef,
++  topLayerRef,
++  underLayerRef,
++  onPeekChange,
++  onSwipeCommit,
++}: Options) {
++  const stateRef = useRef({
++    enabled,
++    onPeekChange,
++    onSwipeCommit,
++  });
++  stateRef.current = { enabled, onPeekChange, onSwipeCommit };
++
++  useEffect(() => {
++    const container = containerRef.current;
++    if (!container) return;
++
++    let active = false;
++    let dragging = false;
++    let startX = 0;
++    let startY = 0;
++    let lastX = 0;
++    let lastT = 0;
++    let vx = 0;
++    let width = 375;
++    let settleTimer = 0;
++
++    const clearStyles = (top: HTMLElement | null, under: HTMLElement | null) => {
++      if (top) {
++        top.style.transform = "";
++        top.style.transition = "";
++        top.style.boxShadow = "";
++        top.style.willChange = "";
++      }
++      if (under) {
++        under.style.transform = "";
++        under.style.transition = "";
++        under.style.opacity = "";
++        under.style.willChange = "";
++      }
++    };
++
++    const canStart = (target: EventTarget | null) => {
++      if (!stateRef.current.enabled) return false;
++      if (document.querySelector(".ios-overlay")) return false;
++      if (!(target instanceof Element)) return true;
++      if (target.closest("input, textarea, select, [role=dialog], [data-swipe-back-ignore]")) return false;
++      return true;
++    };
++
++    const onTouchStart = (e: TouchEvent) => {
++      window.clearTimeout(settleTimer);
++      if (e.touches.length !== 1 || !canStart(e.target)) {
++        active = false;
++        return;
++      }
++      const touch = e.touches[0];
++      if (touch.clientX > EDGE_WIDTH) {
++        active = false;
++        return;
++      }
++      active = true;
++      dragging = false;
++      startX = touch.clientX;
++      startY = touch.clientY;
++      lastX = touch.clientX;
++      lastT = performance.now();
++      vx = 0;
++      width = container.clientWidth || window.innerWidth || 375;
++    };
++
++    const onTouchMove = (e: TouchEvent) => {
++      if (!active || e.touches.length !== 1) return;
++      const touch = e.touches[0];
++      const dx = touch.clientX - startX;
++      const dy = touch.clientY - startY;
++
++      if (!dragging) {
++        if (Math.abs(dy) > 10 && Math.abs(dy) >= Math.abs(dx)) {
++          active = false;
++          return;
++        }
++        if (dx > 10 && dx > Math.abs(dy) * AXIS_RATIO) {
++          dragging = true;
++          stateRef.current.onPeekChange(true);
++          const top = topLayerRef.current;
++          const under = underLayerRef.current;
++          if (top) {
++            top.style.transition = "none";
++            top.style.willChange = "transform";
++            top.style.boxShadow = "-12px 0 32px rgba(0,0,0,.38)";
++          }
++          if (under) {
++            under.style.transition = "none";
++            under.style.willChange = "transform, opacity";
++          }
++        } else {
++          return;
++        }
++      }
++
++      e.preventDefault();
++      const now = performance.now();
++      const dt = Math.max(1, now - lastT);
++      vx = (touch.clientX - lastX) / dt;
++      lastX = touch.clientX;
++      lastT = now;
++
++      const clamped = Math.max(0, Math.min(width, dx));
++      const progress = clamped / width;
++      const top = topLayerRef.current;
++      const under = underLayerRef.current;
++      if (top) top.style.transform = `translate3d(${clamped}px, 0, 0)`;
++      if (under) {
++        under.style.transform = `translate3d(${(-22 * (1 - progress)).toFixed(2)}%, 0, 0)`;
++        under.style.opacity = `${(0.84 + 0.16 * progress).toFixed(3)}`;
++      }
++    };
++
++    const finish = (cancelled: boolean) => {
++      if (!active) return;
++      active = false;
++      if (!dragging) return;
++      dragging = false;
++
++      const dx = Math.max(0, lastX - startX);
++      const shouldCommit = !cancelled && (dx >= width * COMMIT_RATIO || (vx >= FLICK_VELOCITY && dx >= 32));
++      const top = topLayerRef.current;
++      const under = underLayerRef.current;
++      const ease = "160ms cubic-bezier(.22, 1, .36, 1)";
++
++      if (top) {
++        top.style.transition = `transform ${ease}`;
++        top.style.transform = shouldCommit ? `translate3d(${width}px, 0, 0)` : "translate3d(0, 0, 0)";
++      }
++      if (under) {
++        under.style.transition = `transform ${ease}, opacity ${ease}`;
++        under.style.transform = shouldCommit ? "translate3d(0, 0, 0)" : "translate3d(-22%, 0, 0)";
++        under.style.opacity = shouldCommit ? "1" : "0.84";
++      }
++
++      if (shouldCommit) haptic("light");
++      settleTimer = window.setTimeout(() => {
++        clearStyles(top, under);
++        stateRef.current.onPeekChange(false);
++        if (shouldCommit) stateRef.current.onSwipeCommit();
++      }, 165);
++    };
++
++    const onTouchEnd = () => finish(false);
++    const onTouchCancel = () => finish(true);
++
++    container.addEventListener("touchstart", onTouchStart, { passive: true });
++    container.addEventListener("touchmove", onTouchMove, { passive: false });
++    container.addEventListener("touchend", onTouchEnd, { passive: true });
++    container.addEventListener("touchcancel", onTouchCancel, { passive: true });
++
++    return () => {
++      window.clearTimeout(settleTimer);
++      container.removeEventListener("touchstart", onTouchStart);
++      container.removeEventListener("touchmove", onTouchMove);
++      container.removeEventListener("touchend", onTouchEnd);
++      container.removeEventListener("touchcancel", onTouchCancel);
++      clearStyles(topLayerRef.current, underLayerRef.current);
++    };
++  }, [containerRef, topLayerRef, underLayerRef]);
++}
+diff --git a/src/shared/ui/hooks/useTabSwipe.ts b/src/shared/ui/hooks/useTabSwipe.ts
+index ca4d126..187b2b7 100644
+--- a/src/shared/ui/hooks/useTabSwipe.ts
++++ b/src/shared/ui/hooks/useTabSwipe.ts
+@@ -1,4 +1,5 @@
+ import { useEffect, useRef, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
++import { hapticSelect } from "../../lib/haptics";
+ 
+ const SWIPE_DISTANCE = 56;
+ const AXIS_RATIO = 1.35;
+@@ -44,6 +45,7 @@ export function useTabSwipe<T extends HTMLElement>({
+     const next = dx < 0 ? current.current.tabIndex + 1 : current.current.tabIndex - 1;
+     if (next < 0 || next >= current.current.tabCount) return;
+     armClickSuppression();
++    hapticSelect();
+     current.current.onTabChange(next);
+   };
+ 
 diff --git a/src/shared/ui/ios/controls.tsx b/src/shared/ui/ios/controls.tsx
-index 2df27b0..b05b549 100644
+index 2df27b0..e680404 100644
 --- a/src/shared/ui/ios/controls.tsx
 +++ b/src/shared/ui/ios/controls.tsx
-@@ -1,16 +1,24 @@
+@@ -1,24 +1,35 @@
 -import { Children, forwardRef, type ButtonHTMLAttributes, type CSSProperties, type FormHTMLAttributes, type HTMLAttributes, type ImgHTMLAttributes, type InputHTMLAttributes, type TextareaHTMLAttributes } from "react";
-+import { Children, forwardRef, type ButtonHTMLAttributes, type CSSProperties, type MouseEvent as ReactMouseEvent, type FormHTMLAttributes, type HTMLAttributes, type ImgHTMLAttributes, type InputHTMLAttributes, type TextareaHTMLAttributes } from "react";
++import { Children, forwardRef, type ButtonHTMLAttributes, type ChangeEvent, type CSSProperties, type MouseEvent as ReactMouseEvent, type FormHTMLAttributes, type HTMLAttributes, type ImgHTMLAttributes, type InputHTMLAttributes, type PointerEvent as ReactPointerEvent, type TextareaHTMLAttributes } from "react";
  import { cn } from "../../lib/cn";
  import { tr } from "../../i18n";
  
-+import { haptic, type HapticKind } from "../../lib/haptics";
++import { haptic, hapticSelect, hapticSlide, type HapticKind } from "../../lib/haptics";
  type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
    variant?: "primary" | "secondary" | "ghost" | "danger";
 +  /** 触感档位。外层已经自己触发（如 Toggle）时传 "none"，避免一次点击响两下。 */
@@ -648,6 +1285,41 @@ index 2df27b0..b05b549 100644
      data-ui="button" data-variant={intent} data-card={card || undefined}
      className={cn("ios-button", `ios-button-${intent}`, className)}>
      {children}
+   </button>;
+ });
+ 
+-export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...props }, ref) {
+-  return <input {...props} ref={ref} aria-label={props["aria-label"] ?? props.placeholder}
++export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, onChange, ...props }, ref) {
++  const handleChange = props.type === "range"
++    ? (e: ChangeEvent<HTMLInputElement>) => { hapticSlide(); onChange?.(e); }
++    : onChange;
++  return <input {...props} ref={ref} onChange={handleChange} aria-label={props["aria-label"] ?? props.placeholder}
+     data-ui={props.type === "range" ? "range" : "input"}
+     className={cn(props.type === "range" ? "ios-range" : "ios-input", className)} />;
+ });
+@@ -31,14 +42,19 @@ export const Surface = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>
+   </div>;
+ });
+ type SegmentedStyle = CSSProperties & { "--segment-count": number; "--segment-index": number };
+-export function SegmentedControl({ children, className, style, activeIndex, ...props }: HTMLAttributes<HTMLDivElement> & { activeIndex: number }) {
++export function SegmentedControl({ children, className, style, activeIndex, onPointerDownCapture, ...props }: HTMLAttributes<HTMLDivElement> & { activeIndex: number }) {
+   const segments = Children.toArray(children);
+   const count = Math.max(segments.length, 1);
+   const index = Math.max(0, Math.min(activeIndex, count - 1));
++  const handlePointerDownCapture = (e: ReactPointerEvent<HTMLDivElement>) => {
++    const btn = (e.target as Element | null)?.closest("button");
++    if (btn && btn.getAttribute("aria-pressed") !== "true") hapticSelect();
++    onPointerDownCapture?.(e);
++  };
+   /* The selected index lives here so segment count and indicator travel cannot drift apart. */
+   /* Keep rendered segment children untouched for focus and accessibility order. */
+   const segmentStyle = { ...style, "--segment-count": count, "--segment-index": index } as SegmentedStyle;
+-  return <div {...props} style={segmentStyle} className={cn("ios-segmented", className)} role={props.role ?? "group"} aria-label={props["aria-label"] ?? tr("切换内容")}>
++  return <div {...props} onPointerDownCapture={handlePointerDownCapture} style={segmentStyle} className={cn("ios-segmented", className)} role={props.role ?? "group"} aria-label={props["aria-label"] ?? tr("切换内容")}>
+     <span className="ios-segmented-indicator" aria-hidden="true" />
+     <span className="ios-segmented-items">{segments}</span>
+   </div>;
 diff --git a/src/shared/ui/ui.tsx b/src/shared/ui/ui.tsx
 index 370a871..7f51c32 100644
 --- a/src/shared/ui/ui.tsx
@@ -670,18 +1342,93 @@ index 370a871..7f51c32 100644
        <span className="ios-switch-track" aria-hidden="true">
          <span className="ios-switch-thumb">
 diff --git a/src/styles/ios.css b/src/styles/ios.css
-index b5007e4..1dc9b90 100644
+index b5007e4..36832c9 100644
 --- a/src/styles/ios.css
 +++ b/src/styles/ios.css
-@@ -421,7 +421,10 @@ body { background:var(--motion-paper); }
+@@ -140,7 +140,7 @@ html.theme-light {
+ .ios-nav-btn.ios-button { display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; min-width:40px; min-height:40px; padding:0; flex-shrink:0; border-radius:50%; color:var(--p-on); background:transparent; }
+ /* Subpage header surfaces span the panel; only their content shares the
+    centered column with the scroller. Padding absorbs asymmetric safe insets. */
+-.ios-page { container-type:inline-size; background:var(--p-bg); }
++.ios-page { container-type:inline-size; contain:layout style; background:var(--p-bg); }
+ .ios-page>.scroll-y,
+ .ios-page>.shrink-0:not(.ios-subpage-header),
+ .ios-page>.ios-subpage-header>.ios-subpage-bar,
+@@ -362,7 +362,7 @@ body { background:var(--motion-paper); }
+     color-mix(in srgb,var(--p-bg) 97%,var(--p-primary)) 100%);
+ }
+ .ios-page-title { letter-spacing:0; font-weight:800; }
+-.ios-page-heading { animation:motion-title-in .62s var(--motion-spring-soft) both; }
++.ios-page-heading { animation:motion-title-in .22s cubic-bezier(.22,1,.36,1) both; }
+ .ios-section-label { letter-spacing:.04em; font-size:12px; font-weight:650; color:var(--p-mut); }
+ 
+ .ios-surface,
+@@ -398,9 +398,9 @@ body { background:var(--motion-paper); }
+   padding:12px calc(14px + var(--sar,0px)) var(--sab,0px) calc(14px + var(--sal,0px));
+ }
+ .ios-mobile-nav .hg-glass { height:66px; }
+-.ios-mobile-nav .hg-drop { top:6px; bottom:6px; transition:transform .34s var(--motion-spring); }
++.ios-mobile-nav .hg-drop { top:6px; bottom:6px; transition:transform .26s cubic-bezier(.22,1.15,.36,1); }
+ .ios-mobile-nav .hg-drop>.ios-liquid-fill { margin-inline:4px; width:calc(100% - 8px); background:var(--motion-ink); box-shadow:0 4px 0 rgb(25 25 25 / .12); }
+-.ios-mobile-nav .ios-mobile-nav-item { color:var(--p-mut); transition:color .22s ease,scale .28s var(--motion-spring); }
++.ios-mobile-nav .ios-mobile-nav-item { color:var(--p-mut); transition:color .16s ease,scale .24s var(--motion-spring-soft); }
+ .ios-mobile-nav .ios-mobile-nav-item[aria-current=page] { color:var(--motion-on-ink); }
+ 
+ .ios-dialog { border-radius:32px; background:var(--glass-bg); border-color:var(--glass-edge); box-shadow:var(--ios-shadow); backdrop-filter:blur(28px) saturate(150%); -webkit-backdrop-filter:blur(28px) saturate(150%); }
+@@ -412,20 +412,30 @@ body { background:var(--motion-paper); }
+ .pressable { transition:scale .24s var(--motion-spring),opacity .16s ease,background-color .2s ease,color .2s ease; }
+ .pressable:active { scale:.965; }
+ 
+-@keyframes motion-title-in { from{opacity:0;transform:translate3d(-10px,6px,0)} 72%{opacity:1;transform:translate3d(2px,0,0)} to{opacity:1;transform:none} }
+-@keyframes motion-rise { 0%{opacity:0;transform:translate3d(0,14px,0) scale(.98)} 72%{opacity:1;transform:translate3d(0,-2px,0)} 100%{opacity:1;transform:none} }
+-@keyframes motion-page-in { 0%{opacity:0;transform:translate3d(18px,0,0) scale(.99)} 72%{opacity:1;transform:translate3d(-2px,0,0)} 100%{opacity:1;transform:none} }
+-@keyframes motion-tab-in { 0%{opacity:.2;transform:translate3d(0,20px,0)} 70%{opacity:1;transform:translate3d(0,-3px,0)} 100%{opacity:1;transform:none} }
++@keyframes motion-title-in { from{opacity:.7;transform:translate3d(0,4px,0)} to{opacity:1;transform:none} }
++@keyframes motion-rise { 0%{opacity:0;transform:translate3d(0,10px,0)} 100%{opacity:1;transform:none} }
++@keyframes motion-page-in { from{transform:translate3d(100%,0,0)} to{transform:translate3d(0,0,0)} }
++@keyframes motion-page-out { from{transform:translate3d(0,0,0)} to{transform:translate3d(100%,0,0)} }
++@keyframes motion-page-under-in { from{opacity:.86;transform:translate3d(-18%,0,0)} to{opacity:1;transform:translate3d(0,0,0)} }
++@keyframes motion-win-page-in { from{opacity:0;transform:translate3d(18px,0,0)} to{opacity:1;transform:none} }
++@keyframes motion-win-page-out { from{opacity:1;transform:none} to{opacity:0;transform:translate3d(18px,0,0)} }
++@keyframes motion-tab-forward { from{opacity:.72;transform:translate3d(14px,0,0)} to{opacity:1;transform:none} }
++@keyframes motion-tab-backward { from{opacity:.72;transform:translate3d(-14px,0,0)} to{opacity:1;transform:none} }
+ @keyframes motion-dialog-in { 0%{opacity:0;transform:translate3d(0,14px,0) scale(.97)} 72%{opacity:1;transform:translate3d(0,-2px,0) scale(1.005)} 100%{opacity:1;transform:none} }
+ @keyframes motion-sheet-in { 0%{opacity:0;transform:translate3d(0,36px,0)} 72%{opacity:1;transform:translate3d(0,-3px,0)} 100%{opacity:1;transform:none} }
  @keyframes motion-dialog-out { from{opacity:1;transform:none} to{opacity:0;transform:translate3d(0,8px,0) scale(.985)} }
- .a-rise { animation:motion-rise .42s var(--motion-spring) both; }
- .a-page-in,.win-page-in { animation:motion-page-in .4s var(--motion-spring) both; }
+-.a-rise { animation:motion-rise .42s var(--motion-spring) both; }
+-.a-page-in,.win-page-in { animation:motion-page-in .4s var(--motion-spring) both; }
 -.ios-tab-active { animation:motion-tab-in .34s var(--motion-spring) both; }
-+.ios-tab-active { animation:tab-reveal .12s ease-out both; }
-+@keyframes tab-reveal { from { opacity:.88 } to { opacity:1 } }
-+.a-page-in { animation:page-reveal .18s ease-out both; }
-+@keyframes page-reveal { from { transform:translateX(8px); opacity:.94 } to { transform:none; opacity:1 } }
++.a-rise { animation:motion-rise .24s cubic-bezier(.22,1,.36,1) both; }
++.a-page-in { will-change:transform; animation:motion-page-in .26s cubic-bezier(.32,.72,0,1) both; }
++.a-page-out { will-change:transform; animation:motion-page-out .13s cubic-bezier(.32,.72,0,1) both; }
++.a-page-under-in { will-change:transform,opacity; animation:motion-page-under-in .13s cubic-bezier(.32,.72,0,1) both; }
++.win-page-in { will-change:transform,opacity; animation:motion-win-page-in .2s cubic-bezier(.22,1,.36,1) both; }
++.win-page-out { will-change:transform,opacity; animation:motion-win-page-out .13s cubic-bezier(.4,0,1,1) both; }
++.ios-tab-active { will-change:transform,opacity; animation:motion-tab-forward .18s cubic-bezier(.22,1,.36,1) both; }
++.ios-tab-active[data-tab-dir="backward"] { animation-name:motion-tab-backward; }
  .a-toast { animation:motion-dialog-in .34s var(--motion-spring) both; }
  
  @media(prefers-reduced-motion:reduce) {
+-  .ios-page-heading,.a-rise,.a-page-in,.win-page-in,.ios-tab-active,.a-toast,.ios-overlay.is-open .ios-dialog,.ios-overlay-sheet.is-open .ios-dialog,.ios-overlay.is-closing .ios-dialog { animation:none!important; }
++  .ios-page-heading,.a-rise,.a-page-in,.a-page-out,.a-page-under-in,.win-page-in,.win-page-out,.ios-tab-active,.a-toast,.ios-overlay.is-open .ios-dialog,.ios-overlay-sheet.is-open .ios-dialog,.ios-overlay.is-closing .ios-dialog { animation:none!important; }
+   .ios-button,.ios-icon-button,.ios-surface,.ios-account-card,.ios-setting-group,.ios-rank-row,.ios-poster,.ios-poster-art,.pressable,.ios-mobile-nav .ios-mobile-nav-item,.ios-segmented-indicator { transition-duration:.01ms!important; scale:1!important; }
+ }
+ 
+@@ -484,7 +494,7 @@ html.theme-light {
+   border-color:var(--glass-edge);
+   box-shadow:var(--surface-shadow);
+ }
+-.ios-setting-group,.ios-account-card { backdrop-filter:blur(calc(var(--glass-blur) - 4px)) saturate(145%); -webkit-backdrop-filter:blur(calc(var(--glass-blur) - 4px)) saturate(145%); }
++.ios-setting-group,.ios-account-card { background:var(--p-s1); }
+ .ios-account-card { border-radius:32px; }
+ .ios-rank-row { border-radius:26px; background:color-mix(in srgb,var(--p-s1) 88%,transparent); }
+ .ios-setting-group { border-radius:30px; }
+@@ -534,7 +544,7 @@ html.theme-light {
+ .ios-history-chip-remove:active { background:var(--p-s4); color:var(--p-on); }
+ 
+ .ios-dialog { overflow:auto; }
+-.ios-mobile-nav .hg-drop { z-index:0; will-change:transform; transition:transform .34s var(--motion-spring); }
++.ios-mobile-nav .hg-drop { z-index:0; will-change:transform; transition:transform .26s cubic-bezier(.22,1.15,.36,1); }
+ .ios-mobile-nav .hg-drop>.ios-liquid-fill { position:relative; overflow:hidden; border-radius:inherit; }
+ .ios-mobile-nav .hg-drop>.ios-liquid-fill::after { display:none; }
+ .ios-mobile-nav .ios-mobile-nav-item[aria-current=page] { animation:none; }

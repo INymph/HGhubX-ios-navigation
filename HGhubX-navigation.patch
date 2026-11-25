@@ -1,0 +1,687 @@
+diff --git a/src-tauri/src/api/platform.rs b/src-tauri/src/api/platform.rs
+index 2da2b6f..611cd02 100644
+--- a/src-tauri/src/api/platform.rs
++++ b/src-tauri/src/api/platform.rs
+@@ -98,3 +98,23 @@ pub async fn cache_clear(
+     crate::media::clear_caches();
+     crate::cache::clear_web_cache(&webview).await
+ }
++
++/* ──────── 触感（iOS 走 Taptic Engine，其余平台由前端回退 Web Vibration） ──────── */
++
++#[tauri::command]
++pub fn haptic(app: tauri::AppHandle, kind: String) -> Result<bool, String> {
++    #[cfg(target_os = "ios")]
++    {
++        let queued = app
++            .run_on_main_thread(move || {
++                crate::ios_haptic::play(&kind);
++            })
++            .is_ok();
++        return Ok(queued);
++    }
++    #[cfg(not(target_os = "ios"))]
++    {
++        let _ = (&app, kind);
++        Ok(false)
++    }
++}
+diff --git a/src-tauri/src/ios_haptic.rs b/src-tauri/src/ios_haptic.rs
+new file mode 100644
+index 0000000..f298666
+--- /dev/null
++++ b/src-tauri/src/ios_haptic.rs
+@@ -0,0 +1,164 @@
++// iOS 触感反馈（Taptic Engine）。
++//
++// 为什么不用 Core Haptics：CHHapticEngine 在某些机型/状态下启动失败会**静默无声**，
++// 而 UIFeedbackGenerator 走系统统一通道，且用户关掉「系统触感」时系统会自动忽略，
++// 天然符合无障碍要求。这里的取舍是「稳定出声 > 波形自由」。
++//
++// 质感靠的是 style 选择，不是加大强度：
++//   rigid(4)   —— 高锐度、零拖尾，最像机械微动开关的"咔"
++//   soft(3)    —— 钝、闷，适合"收回/收起"这类下沉语义
++//   light(0)   —— 轻回弹
++//   medium(1)  —— 明确确认
++//   heavy(2)   —— 重落点，只给危险操作
++//
++// 延迟：generator 首次创建要连 Taptic Engine（约 20–40ms）。所以这里把 6 个 generator
++// 缓存成常驻对象，交互开始前由前端发一次 `prepare`，真正要震时直接 impact = 0 延迟。
++
++use objc2::rc::{autoreleasepool, Retained};
++use objc2::runtime::AnyObject;
++use objc2::{class, msg_send};
++use std::cell::RefCell;
++
++const IMPACT_LIGHT: i64 = 0;
++const IMPACT_MEDIUM: i64 = 1;
++const IMPACT_HEAVY: i64 = 2;
++const IMPACT_SOFT: i64 = 3;
++const IMPACT_RIGID: i64 = 4;
++
++const SLOT_LIGHT: usize = 0;
++const SLOT_MEDIUM: usize = 1;
++const SLOT_HEAVY: usize = 2;
++const SLOT_SOFT: usize = 3;
++const SLOT_RIGID: usize = 4;
++const SLOT_SELECTION: usize = 5;
++const SLOT_NOTIFICATION: usize = 6;
++const SLOTS: usize = 7;
++
++thread_local! {
++    static GENERATORS: RefCell<[Option<Retained<AnyObject>>; SLOTS]> =
++        const { RefCell::new([None, None, None, None, None, None, None]) };
++}
++
++unsafe fn make_impact(style: i64) -> Option<Retained<AnyObject>> {
++    unsafe {
++        let cls = class!(UIImpactFeedbackGenerator);
++        let obj: *mut AnyObject = msg_send![cls, alloc];
++        if obj.is_null() {
++            return None;
++        }
++        let obj: *mut AnyObject = msg_send![obj, initWithStyle: style];
++        Retained::from_raw(obj)
++    }
++}
++
++unsafe fn make_selection() -> Option<Retained<AnyObject>> {
++    unsafe {
++        let cls = class!(UISelectionFeedbackGenerator);
++        let obj: *mut AnyObject = msg_send![cls, alloc];
++        if obj.is_null() {
++            return None;
++        }
++        let obj: *mut AnyObject = msg_send![obj, init];
++        Retained::from_raw(obj)
++    }
++}
++
++unsafe fn make_notification() -> Option<Retained<AnyObject>> {
++    unsafe {
++        let cls = class!(UINotificationFeedbackGenerator);
++        let obj: *mut AnyObject = msg_send![cls, alloc];
++        if obj.is_null() {
++            return None;
++        }
++        let obj: *mut AnyObject = msg_send![obj, init];
++        Retained::from_raw(obj)
++    }
++}
++
++fn slot_for(kind: &str) -> usize {
++    match kind {
++        "light" => SLOT_LIGHT,
++        "medium" => SLOT_MEDIUM,
++        "strong" | "heavy" => SLOT_HEAVY,
++        "snap" => SLOT_SOFT,
++        "select" | "selection" => SLOT_SELECTION,
++        "success" | "warning" | "error" => SLOT_NOTIFICATION,
++        // tick 是默认档：最清脆的那种微动开关声
++        _ => SLOT_RIGID,
++    }
++}
++
++/// 取（必要时创建）指定槽位的 generator。返回 true 表示句柄可用。
++fn with_generator<F: FnOnce(&AnyObject)>(slot: usize, f: F) -> bool {
++    GENERATORS.with(|cell| {
++        let mut slots = match cell.try_borrow_mut() {
++            Ok(v) => v,
++            Err(_) => return false,
++        };
++        if slots[slot].is_none() {
++            let made = unsafe {
++                match slot {
++                    SLOT_SELECTION => make_selection(),
++                    SLOT_NOTIFICATION => make_notification(),
++                    SLOT_SOFT => make_impact(IMPACT_SOFT),
++                    SLOT_RIGID => make_impact(IMPACT_RIGID),
++                    SLOT_LIGHT => make_impact(IMPACT_LIGHT),
++                    SLOT_MEDIUM => make_impact(IMPACT_MEDIUM),
++                    SLOT_HEAVY => make_impact(IMPACT_HEAVY),
++                    _ => make_impact(IMPACT_RIGID),
++                }
++            };
++            slots[slot] = made;
++        }
++        match slots[slot].as_ref() {
++            Some(obj) => {
++                f(&**obj);
++                true
++            }
++            None => false,
++        }
++    })
++}
++
++fn prepare_slot(slot: usize) -> bool {
++    with_generator(slot, |obj| unsafe {
++        let _: () = msg_send![obj, prepare];
++    })
++}
++
++fn fire(slot: usize) -> bool {
++    let ok = with_generator(slot, |obj| unsafe {
++        match slot {
++            SLOT_SELECTION => {
++                let _: () = msg_send![obj, selectionChanged];
++            }
++            SLOT_NOTIFICATION => {
++                // 0 = success，走系统自带的"预备 + 落点"组合波形
++                let _: () = msg_send![obj, notificationOccurred: 0i64];
++            }
++            _ => {
++                let _: () = msg_send![obj, impactOccurred];
++            }
++        }
++    });
++    if ok {
++        // 系统要求触发后重新 prepare，否则下一次会迟
++        let _ = prepare_slot(slot);
++    }
++    ok
++}
++
++/// 由 `api::platform::haptic` 在主线程调用。
++/// 返回 false 表示这台机器/这个状态下没发出震动（调用方据此回退 Web Vibration）。
++pub fn play(kind: &str) -> bool {
++    autoreleasepool(|_| {
++        if kind == "prepare" {
++            let mut any = false;
++            for slot in 0..SLOTS {
++                any |= prepare_slot(slot);
++            }
++            return any;
++        }
++        fire(slot_for(kind))
++    })
++}
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 0ab2034..6e20c73 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -5,6 +5,8 @@ mod channel_page;
+ mod edge_crypto;
+ mod env;
+ #[cfg(target_os = "ios")]
++#[cfg(target_os = "ios")]
++mod ios_haptic;
+ mod ios_layout;
+ #[cfg(any(target_os = "ios", test))]
+ mod ios_media_http;
+@@ -243,6 +245,7 @@ pub fn run() {
+             api::update::open_url,
+             api::platform::set_orientation,
+             api::platform::set_text_interaction,
++            api::platform::haptic,
+             api::account::api_login,
+             api::account::api_register,
+             api::account::api_logout,
+diff --git a/src/app/App.tsx b/src/app/App.tsx
+index e0f9306..7dc7a7a 100644
+--- a/src/app/App.tsx
++++ b/src/app/App.tsx
+@@ -1,6 +1,6 @@
+ import { LiquidIndicator, Loader } from "../shared/ui/ios/effects";
+ import { Button } from "../shared/ui/ios/controls";
+-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
++import { lazy, startTransition, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+ import { useStore, type Page, type Tab } from "../shared/model/store";
+ import { PageCoveredContext } from "../shared/model/pageVisibility";
+ import { isMobile, selfTest } from "../shared/api/api";
+@@ -16,6 +16,7 @@ import { tracePlayback } from "../shared/diagnostics/playbackDiagnostics";
+ import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF } from "../shared/ui/icons";
+ import { tr, useLocale } from "../shared/i18n";
+ 
++import { hapticSelect } from "../shared/lib/haptics";
+ // Local chunks load on first visit; visited tabs stay mounted as before.
+ // Feed (+ hls.js) is separated from the initial shell so cold start mounts chrome and
+ // starts app_boot / autoLine / api_feed before compiling the 524 kB media engine.
+@@ -57,7 +58,7 @@ function TabBar() {
+       <div className="ios-mobile-nav-items">
+         {items.map(({ key, label, Icon, Active }) => {
+           const Glyph = tab === key ? Active : Icon;
+-          return <Button key={key} className="ios-mobile-nav-item" onClick={() => {
++          return <Button key={key} haptic="none" className="ios-mobile-nav-item" onClick={() => {
+             /* Re-tapping the active Search tab returns to the search landing state;
+                the input clear button is hard to reach on tall screens. */
+             if (key === "search" && tab === "search") {
+@@ -68,7 +69,10 @@ function TabBar() {
+               window.dispatchEvent(new Event("hg:profile-reset"));
+               return;
+             }
+-            setTab(key);
++            if (key === tab) return;
++            hapticSelect();
++            /* 低优先级提交：tab 图标与触感立刻响应，页面渲染让出一帧。 */
++            startTransition(() => setTab(key));
+           }}
+             aria-current={tab === key ? "page" : undefined}>
+             <Glyph size={22} /><span>{label}</span>
+@@ -177,12 +181,9 @@ function LayerBox({
+   }, [hidden]);
+ 
+   const entering = !hidden && !entered && !!enterClass;
+-  const baseStyle: CSSProperties | undefined = entering
+-    ? { ...style, boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }
++  const boxStyle = hidden && hasPip
++    ? { ...style, visibility: "hidden" as const, pointerEvents: "none" as const }
+     : style;
+-  const boxStyle: CSSProperties | undefined = hidden && hasPip
+-    ? { ...baseStyle, visibility: "hidden", pointerEvents: "none" }
+-    : baseStyle;
+   const boxClass = hidden
+     ? (hasPip ? `${className} pointer-events-none` : `${className} hidden pointer-events-none`)
+     : `${className}${entering ? ` ${enterClass}` : ""}`;
+@@ -205,15 +206,27 @@ function MainTabs({ wide, pageActive, covered, bottomInset }: { wide: boolean; p
+     if (pageActive) setVisited(previous => previous.has(tab) ? previous : new Set([...previous, tab]));
+   }, [tab, pageActive]);
+   const mounted = (key: Tab) => visited.has(key) || (pageActive && tab === key);
++  const mountHome = mounted("home");
++  const activeHome = pageActive && tab === "home";
++  const paneHome = useMemo(() => mountHome && <Home active={activeHome} bottomInset={bottomInset} />, [mountHome, activeHome, bottomInset]);
++  const mountSearch = mounted("search");
++  const activeSearch = pageActive && tab === "search";
++  const paneSearch = useMemo(() => mountSearch && <Suspense fallback={<PageLoading />}> <Search active={activeSearch} wide={wide} /></Suspense>, [mountSearch, activeSearch, wide]);
++  const mountCategory = mounted("category");
++  const activeCategory = pageActive && tab === "category";
++  const paneCategory = useMemo(() => mountCategory && <Suspense fallback={<PageLoading />}> <Category active={activeCategory} wide={wide} /></Suspense>, [mountCategory, activeCategory, wide]);
++  const mountProfile = mounted("profile");
++  const activeProfile = pageActive && tab === "profile";
++  const paneProfile = useMemo(() => mountProfile && <Suspense fallback={<PageLoading />}> <Profile active={activeProfile} wide={wide} /></Suspense>, [mountProfile, activeProfile, wide]);
+   const visible = (key: Tab) => tab === key ? `absolute inset-0 ${key === "home" ? "" : "ios-tab-active"}` : "absolute inset-0 hidden pointer-events-none";
+   // First visits mount on demand; subsequent switches preserve queries, scroll and playback state.
+   // DialogFrame's syncBackground() owns modal inertness so portals inside fullscreenElement never inherit ancestor inert.
+   return (
+     <LayerBox hidden={covered} inert={covered} ariaHidden={covered} className="absolute inset-0">
+-      <div className={visible("home")} inert={covered || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{mounted("home") && <Home active={pageActive && tab === "home"} bottomInset={bottomInset} />}</div>
+-      <div className={visible("search")} inert={covered || tab !== "search"} aria-hidden={!pageActive || tab !== "search"}>{mounted("search") && <Suspense fallback={<PageLoading />}><Search active={pageActive && tab === "search"} wide={wide} /></Suspense>}</div>
+-      <div className={visible("category")} inert={covered || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{mounted("category") && <Suspense fallback={<PageLoading />}><Category wide={wide} active={pageActive && tab === "category"} /></Suspense>}</div>
+-      <div className={visible("profile")} inert={covered || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{mounted("profile") && <Suspense fallback={<PageLoading />}><Profile wide={wide} active={pageActive && tab === "profile"} /></Suspense>}</div>
++      <div className={visible("home")} inert={covered || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{paneHome}</div>
++      <div className={visible("search")} inert={covered || tab !== "search"} aria-hidden={!pageActive || tab !== "search"}>{paneSearch}</div>
++      <div className={visible("category")} inert={covered || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{paneCategory}</div>
++      <div className={visible("profile")} inert={covered || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{paneProfile}</div>
+     </LayerBox>
+   );
+ }
+diff --git a/src/features/feed/FeedPlayerShellChrome.tsx b/src/features/feed/FeedPlayerShellChrome.tsx
+index e4c90f8..93f7788 100644
+--- a/src/features/feed/FeedPlayerShellChrome.tsx
++++ b/src/features/feed/FeedPlayerShellChrome.tsx
+@@ -16,6 +16,7 @@ import {
+ } from "../../shared/ui/icons";
+ import { tr } from "../../shared/i18n";
+ 
++import { haptic } from "../../shared/lib/haptics";
+ const VideoDetailsPanel = lazy(() => import("./VideoDetailsPanel"));
+ const EpisodesPanel = lazy(() => import("./Panels").then(m => ({ default: m.EpisodesPanel })));
+ const CommentsPanel = lazy(() => import("./Panels").then(m => ({ default: m.CommentsPanel })));
+@@ -240,7 +241,7 @@ export function FeedPlayerShellChrome({
+               paddingLeft: fsSafeLeft,
+               paddingRight: fsSafeRight,
+             }}>
+-            <Button onClick={() => videoRef.current?.toggle()} aria-label={paused ? tr("播放") : tr("暂停")}
++            <Button onClick={() => { haptic(paused ? "tick" : "light"); videoRef.current?.toggle(); }} aria-label={paused ? tr("播放") : tr("暂停")}
+               className="hg-chip shrink-0 w-9 h-9 rounded-full flex items-center justify-center pressable">
+               {paused ? <IPlayF size={18} /> : <IPauseF size={17} />}
+             </Button>
+diff --git a/src/features/feed/MobileHoldGuide.tsx b/src/features/feed/MobileHoldGuide.tsx
+index 10a116b..c0a4c76 100644
+--- a/src/features/feed/MobileHoldGuide.tsx
++++ b/src/features/feed/MobileHoldGuide.tsx
+@@ -91,7 +91,7 @@ function GuideContent({ target, bottomInset, onClose }: Omit<Props, "open">) {
+     </>}
+     <div className="mobile-hold-guide-footer">
+       <p>{tr("长按右半屏 2× 倍速 · 左右滑顺滑换挡")}</p>
+-      <p>{tr("双击暂停播放")}</p>
++      <p>{tr("单击暂停 / 继续播放")}</p>
+       <Button className="mobile-hold-guide-done" onClick={onClose} data-autofocus>{tr("知道了")}</Button>
+     </div>
+   </div>;
+diff --git a/src/features/feed/mobileHold.ts b/src/features/feed/mobileHold.ts
+index 5040c5b..c9b980c 100644
+--- a/src/features/feed/mobileHold.ts
++++ b/src/features/feed/mobileHold.ts
+@@ -1,3 +1,4 @@
++import { haptic } from "../../shared/lib/haptics";
+ export const HOLD_DELAY_MS = 260;
+ /** 长按加速档位：右滑升档、左滑降档，最低 2x。 */
+ export const HOLD_SPEED_STEPS = [2, 3, 4, 6];
+@@ -35,7 +36,7 @@ export function shiftHoldSpeed(s: HoldSpeed, x: number): number | null {
+   const next = HOLD_SPEED_STEPS[Math.min(HOLD_SPEED_STEPS.length - 1, Math.max(0, i + steps))];
+   if (next === s.rate) { s.travel = 0; return null; }
+   s.rate = next;
+-  try { navigator.vibrate?.(15); } catch { /* ignore */ }
++  haptic("light");
+   return next;
+ }
+ 
+diff --git a/src/features/feed/useFeedTouchGestures.ts b/src/features/feed/useFeedTouchGestures.ts
+index c2f5ed6..74ab111 100644
+--- a/src/features/feed/useFeedTouchGestures.ts
++++ b/src/features/feed/useFeedTouchGestures.ts
+@@ -6,6 +6,7 @@ import { resolveFullscreenEpisodeSwipe } from "./fullscreenEpisodeSwipe";
+ import type { FeedPanel, PinchState } from "./useFeedViewport";
+ import { tr } from "../../shared/i18n";
+ 
++import { haptic } from "../../shared/lib/haptics";
+ type Args = {
+   boxRef: RefObject<HTMLDivElement | null>;
+   videoRef: RefObject<VideoHandle | null>;
+@@ -61,7 +62,6 @@ export function useFeedTouchGestures({
+     zone: HoldZone; speed: HoldSpeed | null; rect: HoldRect; rotation: HoldRotation;
+   } | null>(null);
+   /* 单击 / 双击判定：单击净屏，双击暂停 */
+-  const lastTapRef = useRef<{ timer: number | null; clean?: boolean; idle?: boolean }>({ timer: null });
+   /* 双指缩放：scale 1~4，平移跟手指 */
+   const [zoom, setZoom] = useState({ s: 1, x: 0, y: 0, g: false });
+   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+@@ -126,7 +126,7 @@ export function useFeedTouchGestures({
+         holdRef.current = true;
+         if (cur.zone === "slow") setHoldSlow(true);
+         else { cur.speed = createHoldSpeed(cur.x); setHoldSpeed(cur.speed.rate); }
+-        try { navigator.vibrate?.(25); } catch { /* ignore */ }
++        haptic("medium");
+       }, HOLD_DELAY_MS) as unknown as number,
+     };
+     gesture.current = g;
+@@ -236,7 +236,7 @@ export function useFeedTouchGestures({
+             const want = result.target;
+             setEpMap((m) => ({ ...m, [curId]: want }));
+             episodeToast(tr("第 {0}集{1}", want, total ? ` / ${total}` : ""));
+-            try { navigator.vibrate?.(12); } catch { /* ignore */ }
++            haptic("select");
+             return;
+           }
+         }
+@@ -245,33 +245,28 @@ export function useFeedTouchGestures({
+         if (swipeEp && kind === "video" && want) {
+           setEpMap((m) => ({ ...m, [curId]: want }));
+           episodeToast(tr("第 {0}集{1}", want, total ? ` / ${total}` : ""));
+-          try { navigator.vibrate?.(12); } catch { /* ignore */ }
++          haptic("select");
+           return;
+         }
+         if (swipeEp) { go(dir); return; }
+       }
+     }
+-    if (!cancelled && g.mode === "idle" && Date.now() - g.t < 260) {
+-      // 首击立即反馈；第二击恢复首击前的界面，再切换播放。
+-      if (lastTapRef.current.timer) {
+-        window.clearTimeout(lastTapRef.current.timer);
+-        lastTapRef.current.timer = null;
+-        setClean(lastTapRef.current.clean ?? false);
+-        if (!isDesktop && fs) setIdle(lastTapRef.current.idle ?? false);
+-        if (!isDesktop && fs && !lastTapRef.current.idle) arm();
+-        videoRef.current?.toggle();
+-      } else {
+-        lastTapRef.current.clean = clean;
+-        lastTapRef.current.idle = idle;
+-        setClean(!clean);
+-        if (!isDesktop && fs) setIdle(!idle);
+-        /* Re-arm the auto-hide timer whenever fullscreen controls become visible. */
+-        if (!isDesktop && fs) arm();
+-        lastTapRef.current.timer = window.setTimeout(() => {
+-          lastTapRef.current.timer = null;
+-        }, 230) as unknown as number;
++    if (!cancelled && g.mode === "idle") {
++      /* 单击即暂停/继续。
++         旧实现要求 320ms 内抬手才算数，按久一点就整下丢失，手感像"没反应"；
++         控件隐藏时还会走分支吞掉这一击。这里两点都去掉：抬手就执行，
++         控件隐藏时顺带把它们唤回来，但绝不吞播放动作。
++         触感与画面切换在同一个事件里发出，做到"手到眼到"。 */
++      const wasPlaying = videoRef.current?.isPlayWanted() ?? false;
++      if (clean) setClean(false);
++      haptic(wasPlaying ? "light" : "tick");
++      videoRef.current?.toggle();
++      if (!isDesktop && fs) {
++        setIdle(false);
++        arm();
+       }
+     }
++
+   };
+ 
+   useEffect(() => {
+@@ -280,8 +275,6 @@ export function useFeedTouchGestures({
+       onUp(true);
+       pointersRef.current.clear();
+       pinchRef.current = null;
+-      if (lastTapRef.current.timer) window.clearTimeout(lastTapRef.current.timer);
+-      lastTapRef.current.timer = null;
+     }
+     // Cancel pending gestures when the page is hidden or controls are locked.
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+@@ -289,8 +282,6 @@ export function useFeedTouchGestures({
+ 
+   useEffect(() => () => {
+     if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
+-    if (lastTapRef.current.timer) window.clearTimeout(lastTapRef.current.timer);
+-    lastTapRef.current.timer = null;
+     gesture.current = null;
+     holdRef.current = false;
+   }, [playKey]);
+diff --git a/src/features/playback/PlayerControls.tsx b/src/features/playback/PlayerControls.tsx
+index 5220028..8a5f999 100644
+--- a/src/features/playback/PlayerControls.tsx
++++ b/src/features/playback/PlayerControls.tsx
+@@ -6,6 +6,7 @@ import { ICheck, ICompress, IExpand, ILockF, INext, IPauseF, IPip, IPlayF, IThea
+ import type { PlaybackClock } from "./playbackClock";
+ import { tr } from "../../shared/i18n";
+ 
++import { haptic } from "../../shared/lib/haptics";
+ type Props = {
+   paused: boolean;
+   clock: PlaybackClock;
+@@ -81,7 +82,7 @@ export default function PlayerControls({
+       </div>
+ 
+       <div className="desktop-control-row">
+-        <Button className="player-control primary-play" aria-label={paused ? tr("播放") : tr("暂停")} data-tooltip={paused ? tr("播放 Space") : tr("暂停 Space")} onClick={onToggle}>
++        <Button className="player-control primary-play" aria-label={paused ? tr("播放") : tr("暂停")} data-tooltip={paused ? tr("播放 Space") : tr("暂停 Space")} onClick={() => { haptic(paused ? "tick" : "light"); onToggle(); }}>
+           {paused ? <IPlayF size={19} /> : <IPauseF size={18} />}
+         </Button>
+         {onNext && (
+diff --git a/src/shared/lib/haptics.ts b/src/shared/lib/haptics.ts
+new file mode 100644
+index 0000000..8d9e5c2
+--- /dev/null
++++ b/src/shared/lib/haptics.ts
+@@ -0,0 +1,127 @@
++import { invoke } from "@tauri-apps/api/core";
++import { isIos } from "../api/api";
++
++/**
++ * 触感反馈。
++ *
++ * 设计取舍（宁轻勿重、宁短勿长、只震关键节点）：
++ * - 微交互（点按、Tab、刻度）走 iOS 原生 `rigid` / `selection`，是高锐度瞬态，没有拖尾；
++ * - 状态切换（开关、播放/暂停）用 `medium` / `light` 区分方向，绝不使用长震动；
++ * - 结果类（成功/警告/错误）用系统 `notification` 的组合波形，自带"预备 + 落点"节奏；
++ * - iOS 的 WKWebView 没有 `navigator.vibrate`，所以旧代码在 iOS 上是静默空调用；
++ *   这里统一走原生命令，其他平台/失败才回退 Web Vibration。
++ *
++ * 延迟：首次触发会创建 Taptic Engine 的连接，约 20–40ms。所以交互开始（pointerdown、
++ * 页面重新可见）就调用 `hapticPrepare()` 预热，真正要震时才是 0 延迟。
++ */
++
++/** 与 `ios_haptic::play` 的字面量一一对应，不要单独改名。 */
++export type HapticKind =
++  | "tick"      // 最轻的清脆点击：普通按钮、Tab 落点
++  | "select"    // 选择感：分段控件、列表选中
++  | "light"     // 轻回弹：暂停
++  | "medium"    // 明确确认：开始播放、开关打开
++  | "strong"    // 重落点：删除、危险操作确认
++  | "snap"      // 吸附：拖动到刻度/边界后释放
++  | "success"
++  | "warning"
++  | "error";
++
++/** Web Vibration 回退时长（毫秒）；数值按手感调过，不要随意放大。 */
++const VIBRATE_MS: Record<HapticKind, number | number[]> = {
++  tick: 8,
++  select: 8,
++  light: 12,
++  medium: 20,
++  strong: 30,
++  snap: 10,
++  success: [10, 40, 12],
++  warning: 18,
++  error: [14, 46, 14],
++};
++
++/** 同类反馈的最小间隔：连点、拖动时合并成一下，避免变成"持续嗡嗡"。 */
++const MIN_GAP: Record<HapticKind, number> = {
++  tick: 30,
++  select: 30,
++  light: 40,
++  medium: 45,
++  strong: 60,
++  snap: 40,
++  success: 120,
++  warning: 120,
++  error: 120,
++};
++
++let lastAt = 0;
++let lastKind: HapticKind | null = null;
++/** 原生通道失败一次就长期降级，避免每次交互都白跑一次 IPC。 */
++let nativeBroken = false;
++/** 预热节流：1.2s 内不重复请求，避免拖动手势把 IPC 打满。 */
++let preparedAt = 0;
++
++function web(kind: HapticKind) {
++  try {
++    navigator.vibrate?.(VIBRATE_MS[kind]);
++  } catch {
++    /* 不支持的设备就当没这回事，震动绝不能影响交互本身 */
++  }
++}
++
++/** 原生通道当前是否可用（只读，便于诊断与测试）。 */
++export function hapticNativeReady(): boolean {
++  return isIos && !nativeBroken;
++}
++
++/**
++ * 预热 Taptic Engine。在 pointerdown / 页面可见时调用，能抹掉首次触发的几十毫秒延迟。
++ * 没有交互时不要定时调用——那是纯耗电。
++ */
++export function hapticPrepare(): void {
++  if (nativeBroken || !isIos) return;
++  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
++  if (now - preparedAt < 1200) return;
++  preparedAt = now;
++  invoke("haptic", { kind: "prepare" }).catch(() => { nativeBroken = true; });
++}
++
++/**
++ * 触发一次触感。
++ * @param kind 档位，默认 `tick`
++ * @param gapMs 与同类上一次反馈的最小间隔；滑动类交互传更大的值进一步降频
++ */
++export function haptic(kind: HapticKind = "tick", gapMs?: number): void {
++  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
++  const gap = gapMs ?? MIN_GAP[kind];
++  if (now - lastAt < gap && lastKind === kind) return;
++  lastAt = now;
++  lastKind = kind;
++  if (!hapticNativeReady()) {
++    web(kind);
++    return;
++  }
++  invoke<boolean>("haptic", { kind })
++    .then((native) => { if (!native) web(kind); })
++    .catch(() => { nativeBroken = true; web(kind); });
++}
++
++/** 开关：打开给 `medium`（更明确的确认），关闭给 `tick`（干脆的回收声）。 */
++export const hapticToggle = (on: boolean) => haptic(on ? "medium" : "tick");
++
++/** Tab / 分段控件真正换到另一项：一次干净的 `select`。 */
++export const hapticSelect = () => haptic("select");
++
++/** 滑块连续取值：间隔拉到 110ms，按下与松手各一次。 */
++export const hapticSlide = () => haptic("select", 110);
++
++/** 拖到边界/刻度后吸附住的那一下。 */
++export const hapticSnap = () => haptic("snap");
++
++/* 首次按下就预热：iOS 上第一次触感不再"慢半拍"。 */
++if (typeof window !== "undefined") {
++  const warm = () => { hapticPrepare(); };
++  window.addEventListener("pointerdown", warm, { capture: true, once: true, passive: true });
++  document.addEventListener("visibilitychange", () => {
++    if (document.visibilityState === "visible") hapticPrepare();
++  });
++}
+diff --git a/src/shared/ui/ios/controls.tsx b/src/shared/ui/ios/controls.tsx
+index 2df27b0..b05b549 100644
+--- a/src/shared/ui/ios/controls.tsx
++++ b/src/shared/ui/ios/controls.tsx
+@@ -1,16 +1,24 @@
+-import { Children, forwardRef, type ButtonHTMLAttributes, type CSSProperties, type FormHTMLAttributes, type HTMLAttributes, type ImgHTMLAttributes, type InputHTMLAttributes, type TextareaHTMLAttributes } from "react";
++import { Children, forwardRef, type ButtonHTMLAttributes, type CSSProperties, type MouseEvent as ReactMouseEvent, type FormHTMLAttributes, type HTMLAttributes, type ImgHTMLAttributes, type InputHTMLAttributes, type TextareaHTMLAttributes } from "react";
+ import { cn } from "../../lib/cn";
+ import { tr } from "../../i18n";
+ 
++import { haptic, type HapticKind } from "../../lib/haptics";
+ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+   variant?: "primary" | "secondary" | "ghost" | "danger";
++  /** 触感档位。外层已经自己触发（如 Toggle）时传 "none"，避免一次点击响两下。 */
++  haptic?: HapticKind | "none";
+ };
+ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button({
+-  children, className = "", type = "button", variant, disabled, ...props
++  children, className = "", type = "button", variant, disabled, onClick, haptic: hapticKind = "tick", ...props
+ }, ref) {
+   const intent = variant ?? (/(^|\s)(bg-primary|brand-grad)(\s|$)/.test(className) ? "primary" : "ghost");
+   const card = (props.style?.paddingTop !== undefined || props.style?.aspectRatio !== undefined) || /(?:ios-poster|ios-row-card|ios-rank-row|ios-account-card|ios-collection-link|ios-topic-card)/.test(className);
+-  return <button {...props} ref={ref} type={type} disabled={disabled}
++  /* 触感先于 onClick：手指按下到画面响应之间那一帧的"咔"才是手感来源。 */
++  const fire = (e: ReactMouseEvent<HTMLButtonElement>) => {
++    if (hapticKind !== "none") haptic(hapticKind);
++    onClick?.(e);
++  };
++  return <button {...props} ref={ref} type={type} disabled={disabled} onClick={fire}
+     data-ui="button" data-variant={intent} data-card={card || undefined}
+     className={cn("ios-button", `ios-button-${intent}`, className)}>
+     {children}
+diff --git a/src/shared/ui/ui.tsx b/src/shared/ui/ui.tsx
+index 370a871..7f51c32 100644
+--- a/src/shared/ui/ui.tsx
++++ b/src/shared/ui/ui.tsx
+@@ -9,6 +9,7 @@ import { Loader } from "./ios/effects";
+ import { IBoltF, ICheck, IGlobe, IHeartF, IMinus, ISparkF, IStarF } from "./icons";
+ import { tr } from "../i18n";
+ 
++import { hapticToggle } from "../lib/haptics";
+ /* ——— 头像 ——— */
+ export function Avatar({ hue = 250, icon, name, size = 40, ring = false, className = "" }: {
+   hue?: number; icon?: React.ReactNode; name?: string; size?: number; ring?: boolean; className?: string;
+@@ -31,7 +32,7 @@ export function Toggle({ on, onChange, label, disabled = false, desktop = false
+   on: boolean; onChange: (b: boolean) => void; label?: string; disabled?: boolean; desktop?: boolean;
+ }) {
+   return (
+-    <Button disabled={disabled} onClick={() => onChange(!on)} role="switch" aria-checked={on} aria-label={label}
++    <Button disabled={disabled} haptic="none" onClick={() => { hapticToggle(!on); onChange(!on); }} role="switch" aria-checked={on} aria-label={label}
+       className="ios-switch" data-platform={desktop ? "desktop" : platform} data-state={on ? "on" : "off"}>
+       <span className="ios-switch-track" aria-hidden="true">
+         <span className="ios-switch-thumb">
+diff --git a/src/styles/ios.css b/src/styles/ios.css
+index b5007e4..1dc9b90 100644
+--- a/src/styles/ios.css
++++ b/src/styles/ios.css
+@@ -421,7 +421,10 @@ body { background:var(--motion-paper); }
+ @keyframes motion-dialog-out { from{opacity:1;transform:none} to{opacity:0;transform:translate3d(0,8px,0) scale(.985)} }
+ .a-rise { animation:motion-rise .42s var(--motion-spring) both; }
+ .a-page-in,.win-page-in { animation:motion-page-in .4s var(--motion-spring) both; }
+-.ios-tab-active { animation:motion-tab-in .34s var(--motion-spring) both; }
++.ios-tab-active { animation:tab-reveal .12s ease-out both; }
++@keyframes tab-reveal { from { opacity:.88 } to { opacity:1 } }
++.a-page-in { animation:page-reveal .18s ease-out both; }
++@keyframes page-reveal { from { transform:translateX(8px); opacity:.94 } to { transform:none; opacity:1 } }
+ .a-toast { animation:motion-dialog-in .34s var(--motion-spring) both; }
+ 
+ @media(prefers-reduced-motion:reduce) {
